@@ -14,25 +14,52 @@
 package io.openmessaging.benchmark.driver.nats;
 
 
+import io.nats.client.Connection;
 import io.nats.client.JetStream;
 import io.openmessaging.benchmark.driver.BenchmarkProducer;
+import java.util.Arrays;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Semaphore;
+import org.jspecify.annotations.Nullable;
 
 public class NatsBenchmarkProducer implements BenchmarkProducer {
     private final String topic;
 
-    private final JetStream jetStream;
+    private final Connection connection;
+    private final @Nullable JetStream jetStream;
+    private final @Nullable Semaphore pending;
 
-    public NatsBenchmarkProducer(JetStream jetStream, final String topic) {
+    public NatsBenchmarkProducer(
+            Connection connection, JetStream jetStream, String topic, int maxPending) {
+        this.connection = connection;
         this.jetStream = jetStream;
         this.topic = topic;
+        this.pending = maxPending > 0 ? new Semaphore(maxPending) : null;
     }
 
     @Override
     public CompletableFuture<Void> sendAsync(Optional<String> key, byte[] payload) {
-        writeLongToBytes(System.currentTimeMillis(), payload);
-        return jetStream.publishAsync(topic, payload).thenApply(x -> null);
+        byte[] data = Arrays.copyOf(payload, payload.length);
+        writeLongToBytes(System.currentTimeMillis(), data);
+        if (jetStream == null) {
+            try {
+                connection.publish(topic, data);
+                return CompletableFuture.completedFuture(null);
+            } catch (Exception e) {
+                CompletableFuture<Void> f = new CompletableFuture<>();
+                f.completeExceptionally(e);
+                return f;
+            }
+        }
+        if (pending == null) {
+            return jetStream.publishAsync(topic, data).thenApply(x -> null);
+        }
+        pending.acquireUninterruptibly();
+        return jetStream
+                .publishAsync(topic, data)
+                .whenComplete((a, e) -> pending.release())
+                .thenApply(x -> null);
     }
 
     @Override

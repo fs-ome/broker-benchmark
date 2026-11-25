@@ -22,11 +22,11 @@ import io.nats.client.Dispatcher;
 import io.nats.client.ErrorListener;
 import io.nats.client.JetStream;
 import io.nats.client.JetStreamManagement;
-import io.nats.client.JetStreamSubscription;
 import io.nats.client.Message;
 import io.nats.client.Nats;
 import io.nats.client.Options;
 import io.nats.client.PushSubscribeOptions;
+import io.nats.client.api.AckPolicy;
 import io.nats.client.api.ConsumerConfiguration;
 import io.nats.client.api.StreamConfiguration;
 import io.nats.client.api.StreamInfo;
@@ -38,7 +38,9 @@ import io.openmessaging.benchmark.driver.ConsumerCallback;
 import java.io.File;
 import java.io.IOException;
 import java.time.Duration;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
 import org.apache.bookkeeper.stats.StatsLogger;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -46,37 +48,48 @@ import org.slf4j.LoggerFactory;
 public class NatsBenchmarkDriver implements BenchmarkDriver {
     private NatsConfig config;
     private Connection connection;
-    private JetStream jetStream;
     private JetStreamManagement jetStreamManagement;
+    private final List<Connection> clientConnections = new CopyOnWriteArrayList<>();
 
     @Override
     public void initialize(File configurationFile, StatsLogger statsLogger)
             throws IOException, InterruptedException {
         config = mapper.readValue(configurationFile, NatsConfig.class);
         log.info("read config file," + config.toString());
-        this.connection =
-                Nats.connect(
-                        new Options.Builder()
-                                .server(config.natsHostUrl)
-                                .maxReconnects(5)
-                                .reconnectWait(Duration.ofSeconds(1))
-                                .connectionTimeout(Duration.ofSeconds(5))
-                                .pingInterval(Duration.ofSeconds(60))
-                                .errorListener(
-                                        new ErrorListener() {
-                                            @Override
-                                            public void errorOccurred(Connection conn, String error) {
-                                                log.error("Error on connection {}: {}", conn, error);
-                                            }
-
-                                            @Override
-                                            public void exceptionOccurred(Connection conn, Exception exp) {
-                                                log.error("Exception on connection {}", conn, exp);
-                                            }
-                                        })
-                                .build());
-        this.jetStream = connection.jetStream();
+        this.connection = connect();
         this.jetStreamManagement = connection.jetStreamManagement();
+    }
+
+    private Connection connect() throws IOException, InterruptedException {
+        return Nats.connect(
+                new Options.Builder()
+                        .server(config.natsHostUrl)
+                        .maxReconnects(5)
+                        .reconnectWait(Duration.ofSeconds(1))
+                        .connectionTimeout(Duration.ofSeconds(5))
+                        .pingInterval(Duration.ofSeconds(60))
+                        .errorListener(
+                                new ErrorListener() {
+                                    @Override
+                                    public void errorOccurred(Connection conn, String error) {
+                                        log.error("Error on connection {}: {}", conn, error);
+                                    }
+
+                                    @Override
+                                    public void exceptionOccurred(Connection conn, Exception exp) {
+                                        log.error("Exception on connection {}", conn, exp);
+                                    }
+                                })
+                        .build());
+    }
+
+    private Connection clientConnection(boolean own) throws IOException, InterruptedException {
+        if (!own) {
+            return connection;
+        }
+        Connection c = connect();
+        clientConnections.add(c);
+        return c;
     }
 
     @Override
@@ -86,6 +99,9 @@ public class NatsBenchmarkDriver implements BenchmarkDriver {
 
     @Override
     public CompletableFuture<Void> createTopic(String topic, int partitions) {
+        if ("core".equals(config.mode)) {
+            return CompletableFuture.completedFuture(null);
+        }
         try {
             JetStreamManagement jsm = connection.jetStreamManagement();
             StreamInfo streamInfo =
@@ -108,7 +124,14 @@ public class NatsBenchmarkDriver implements BenchmarkDriver {
 
     @Override
     public CompletableFuture<BenchmarkProducer> createProducer(String topic) {
-        return CompletableFuture.completedFuture(new NatsBenchmarkProducer(jetStream, topic));
+        try {
+            Connection c = clientConnection("per-producer".equals(config.producerConnection));
+            JetStream js = "core".equals(config.mode) ? null : c.jetStream();
+            return CompletableFuture.completedFuture(
+                    new NatsBenchmarkProducer(c, js, topic, config.maxPendingPublishes));
+        } catch (Exception e) {
+            return CompletableFuture.failedFuture(e);
+        }
     }
 
     @Override
@@ -118,24 +141,40 @@ public class NatsBenchmarkDriver implements BenchmarkDriver {
         ConsumerConfiguration cc =
                 ConsumerConfiguration.builder()
                         .durable("durable-" + subscriptionName)
+                        .filterSubject(topic) // jnats 2.17+ rejects subscribe(topic) without it
                         .deliverSubject("delivery-subject-" + subscriptionName)
                         .deliverGroup("group-" + subscriptionName)
+                        .maxAckPending(config.maxAckPending)
+                        .ackPolicy(config.ackEvery > 1 ? AckPolicy.All : AckPolicy.Explicit)
                         .build();
         PushSubscribeOptions pso = PushSubscribeOptions.builder().configuration(cc).build();
+        long[] received = {0};
 
         try {
+            Connection c = clientConnection("per-consumer".equals(config.consumerConnection));
+            if ("core".equals(config.mode)) {
+                c.createDispatcher(
+                                msg ->
+                                        consumerCallback.messageReceived(
+                                                msg.getData(), readLongFromBytes(msg.getData())))
+                        .subscribe(topic, "group-" + subscriptionName);
+                return CompletableFuture.completedFuture(new NatsBenchmarkConsumer());
+            }
+
             jetStreamManagement.addOrUpdateConsumer(topic, cc);
 
-            Dispatcher dispatcher = connection.createDispatcher();
+            Dispatcher dispatcher = c.createDispatcher();
 
-            JetStreamSubscription sub =
-                    jetStream.subscribe(
+            c.jetStream()
+                    .subscribe(
                             topic,
                             dispatcher,
                             (Message msg) -> {
                                 long publishTimestamp = readLongFromBytes(msg.getData());
                                 consumerCallback.messageReceived(msg.getData(), publishTimestamp);
-                                msg.ack();
+                                if (config.ackEvery <= 1 || ++received[0] % config.ackEvery == 0) {
+                                    msg.ack();
+                                }
                             },
                             false,
                             pso);
@@ -149,6 +188,9 @@ public class NatsBenchmarkDriver implements BenchmarkDriver {
 
     @Override
     public void close() throws Exception {
+        for (Connection c : clientConnections) {
+            c.close();
+        }
         this.connection.close();
     }
 

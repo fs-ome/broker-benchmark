@@ -24,5 +24,24 @@ public class NatsConfig {
     public StorageType storageType = StorageType.File;
 
     // -1 is unlimited
-    public int maxBytes = -1;
+    public long maxBytes = -1;
+
+    /** Which NATS mode to use (jetstream or core). */
+    public String mode = "jetstream";
+    /**
+     * Whether all producers should share a connection ("shared") or have a unique one each
+     * ("per-producer").
+     */
+    public String producerConnection = "shared";
+    /**
+     * Whether all consumers should share a connection ("shared") or have a unique one each
+     * ("per-consumer").
+     */
+    public String consumerConnection = "shared";
+    /** 0 is unbounded. */
+    public int maxPendingPublishes = 0;
+    /** 0 is the server default of 1000. */
+    public long maxAckPending = 0;
+    /** The message ack interval. <=1 means ack every message. */
+    public int ackEvery = 0;
 }
