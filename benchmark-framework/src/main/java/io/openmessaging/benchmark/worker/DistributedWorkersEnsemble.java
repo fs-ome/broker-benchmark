@@ -20,6 +20,7 @@ import com.beust.jcommander.internal.Maps;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
+import io.openmessaging.benchmark.utils.Env;
 import io.openmessaging.benchmark.utils.ListPartition;
 import io.openmessaging.benchmark.worker.commands.ConsumerAssignment;
 import io.openmessaging.benchmark.worker.commands.CountersStats;
@@ -48,7 +49,12 @@ public class DistributedWorkersEnsemble implements Worker {
         Preconditions.checkArgument(workers.size() > 1);
         this.workers = unmodifiableList(workers);
         leader = workers.get(0);
-        int numberOfProducerWorkers = getNumberOfProducerWorkers(workers, extraConsumerWorkers);
+        // PRODUCER_WORKERS overrides the split: the first N workers produce, the rest consume
+        int numberOfProducerWorkers =
+                Env.get(
+                        "PRODUCER_WORKERS",
+                        Integer::parseInt,
+                        getNumberOfProducerWorkers(workers, extraConsumerWorkers));
         List<List<Worker>> partitions =
                 Lists.partition(Lists.reverse(workers), workers.size() - numberOfProducerWorkers);
         this.producerWorkers = partitions.get(1);
